@@ -1,0 +1,88 @@
+#! /usr/bin/env node
+
+const Promise = require('bluebird')
+const Client = require('pg').Client
+const fs = require('fs')
+const program = require('commander')
+const readline = require('readline')
+
+const rl = readline.createInterface({
+  input: process.stdin,
+  output: process.stdout
+})
+
+program
+  .usage('[options] <file ...>')
+  .option('-s, --schema <schema>', 'schema name to store the data under (default \'ds\')')
+  .parse(process.argv)
+
+const schema = program.schema || 'ds'
+
+if (program.args.length === 0) {
+  console.error('no files provided!')
+  program.help()
+}
+
+const client = new Client()
+
+const filenames = program.args
+const useJsonb = true
+const co = Promise.coroutine
+const readFile = Promise.promisify(fs.readFile)
+
+const load = co(function* (filename) {
+  let data = yield readFile(filename, 'utf8')
+  try {
+    data = JSON.parse(data)
+  } catch (err) {
+    console.error(err)
+  }
+
+  try {
+    yield client.query(`CREATE SCHEMA "${schema}";`)
+    console.log('created schema', schema)
+  } catch (err) {
+    // schema already exists
+  }
+
+  for (const tableName in data) {
+    try {
+      yield client.query(`
+CREATE TABLE "${schema}"."${tableName}" (
+  id text NOT NULL,
+  val ${useJsonb ? 'jsonb' : 'text'} NOT NULL,
+  PRIMARY KEY (id)
+);`
+      )
+      console.log('created table', tableName)
+    } catch (err) {
+      // table already exists
+      console.log(`WARNING: the table ${tableName}, already exists`)
+    }
+    const tableData = data[tableName]
+
+    let recordCount = 0
+    for (const recordName in tableData) {
+      yield client.query(`
+INSERT INTO "${schema}"."${tableName}" (id, val) VALUES
+($1, $2)
+ON CONFLICT (id)
+DO UPDATE SET val = EXCLUDED.val;`,
+        [recordName, { _d: tableData[recordName], _v: 1 }]
+      )
+      recordCount++
+    }
+    console.log('inserted', recordCount, 'records into table', tableName)
+  }
+})
+
+const loadAll = co(function* () {
+  for (const filename of filenames) {
+    yield load(filename)
+  }
+})
+
+client.connect()
+  .then(loadAll)
+  .then(client.end)
+  .catch(console.error.bind(null, 'an error occurred:'))
